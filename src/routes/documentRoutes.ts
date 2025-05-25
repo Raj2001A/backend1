@@ -5,7 +5,7 @@ import { validationSchemas } from '../utils/validationSchemas';
 import { logger } from '../utils/logger';
 import { verifyToken, requireAdmin } from '../middleware/auth';
 import { DocumentModel } from '../models/document';
-import { storageService } from '../services/storageService';
+import { b2StorageService } from '../services/b2StorageService';
 import { ApiError, NotFoundError } from '../middleware/error';
 
 const router = express.Router();
@@ -144,40 +144,63 @@ router.post('/',
         throw new ApiError('Access denied', 403);
       }
 
-      // Upload file to Backblaze B2
-      const uploadResult = await storageService.uploadFile(
-        req.file.buffer,
-        req.file.originalname,
-        req.file.mimetype,
-        `documents/${employee_id}`
-      );
+      try {
+        // Ensure we have a buffer for the file
+        const fileBuffer = Buffer.isBuffer(req.file.buffer) 
+          ? req.file.buffer 
+          : Buffer.from(await req.file.buffer);
+        
+        // Upload file to Backblaze B2
+        const uploadResult = await b2StorageService.uploadFile(
+          fileBuffer,
+          req.file.originalname,
+          req.file.mimetype,
+          'employee-documents'
+        );
 
-      // Create document record in database
-      const document = await DocumentModel.create({
-        name,
-        type,
-        employee_id,
-        file_id: uploadResult.fileId,
-        file_name: req.file.originalname,
-        file_path: uploadResult.filePath,
-        file_size: req.file.size,
-        mime_type: req.file.mimetype,
-        expiry_date: expiry_date ? new Date(expiry_date) : undefined,
-        notes,
-        status: 'active'
-      });
+        // Create document record in database
+        const documentData = {
+          name,
+          type,
+          employee_id,
+          file_id: uploadResult.fileId,
+          file_name: uploadResult.fileName,
+          file_path: uploadResult.filePath,
+        };
 
-      logger.info('Document uploaded successfully', {
-        documentId: document.id,
-        employeeId: employee_id,
-        fileName: req.file.originalname,
-        fileSize: req.file.size
-      });
+        // Get file size
+        const fileSize = Buffer.isBuffer(req.file.buffer) 
+          ? req.file.buffer.length 
+          : req.file.size;
 
-      res.status(201).json({
-        success: true,
-        data: document
-      });
+        // Log upload details with proper typing
+        logger.debug('Uploading file to B2', {
+          originalName: req.file.originalname,
+          size: fileSize,
+          mimeType: req.file.mimetype
+        });
+
+        const document = await DocumentModel.create(documentData);
+
+        logger.info('Document uploaded successfully', {
+          documentId: document.id,
+          employeeId: employee_id,
+          fileName: uploadResult.fileName,
+          fileSize: uploadResult.fileSize
+        });
+
+        res.status(201).json({
+          success: true,
+          data: document
+        });
+      } catch (error) {
+        // Log error with proper typing
+        logger.error('Error uploading document to B2', {
+          error: error instanceof Error ? error.message : 'Unknown error',
+          originalName: req.file?.originalname || 'unknown'
+        });
+        throw new ApiError('Failed to upload document to storage', 500);
+      }
     } catch (error) {
       next(error);
     }
@@ -194,7 +217,7 @@ router.get('/download/:id', verifyToken, async (req, res, next) => {
     const document = await DocumentModel.getById(req.params.id);
     
     if (!document) {
-      throw new NotFoundError(`Document with ID ${req.params.id} not found`);
+      throw new NotFoundError('Document not found');
     }
     
     // Check if user has access to this document
@@ -202,26 +225,23 @@ router.get('/download/:id', verifyToken, async (req, res, next) => {
       throw new ApiError('Access denied', 403);
     }
     
-    // Get download URL from Backblaze B2
-    const downloadUrl = await storageService.getDownloadUrl(document.file_id!, document.file_name!);
-    
-    // Log download
-    logger.info('Document download requested', {
-      documentId: document.id,
-      employeeId: document.employee_id,
-      userId: req.user?.uid,
-      fileName: document.file_name
-    });
-    
-    // Redirect to download URL
-    res.json({
-      success: true,
-      data: {
-        downloadUrl,
-        fileName: document.file_name,
-        mimeType: document.mime_type
+    try {
+      // Get download URL from B2 storage service
+      if (!document.file_id) {
+        throw new ApiError('File ID is missing', 404);
       }
-    });
+      
+      const downloadUrl = await b2StorageService.getDownloadUrl(
+        document.file_id,
+        document.file_name || undefined
+      );
+      
+      // Redirect to the download URL
+      res.redirect(downloadUrl);
+    } catch (error) {
+      logger.error('Error generating download URL:', error);
+      throw new ApiError('Failed to generate download URL', 500);
+    }
   } catch (error) {
     next(error);
   }
@@ -237,31 +257,45 @@ router.delete('/:id', verifyToken, requireAdmin, async (req, res, next) => {
     const document = await DocumentModel.getById(req.params.id);
     
     if (!document) {
-      throw new NotFoundError(`Document with ID ${req.params.id} not found`);
+      throw new NotFoundError('Document not found');
     }
     
-    // Delete file from Backblaze B2
-    if (document.file_id) {
-      await storageService.deleteFile(document.file_id);
+    try {
+      // Delete file from B2 storage if file_id exists
+      if (document.file_id) {
+        try {
+          // Delete the file - pass empty string if file_name is undefined
+          await b2StorageService.deleteFile(document.file_id, document.file_name || '');
+        } catch (error) {
+          // Log error with proper typing
+          logger.error('Error deleting file from storage', {
+            documentId: document.id,
+            error: error instanceof Error ? error.message : 'Unknown error'
+          });
+          // Continue with database deletion even if storage deletion fails
+        }
+      }
+      
+      // Delete document from database
+      await DocumentModel.delete(document.id);
+      
+      logger.info('Document deleted successfully', {
+        documentId: document.id,
+        employeeId: document.employee_id,
+        fileName: document.file_name
+      });
+      
+      res.json({
+        success: true,
+        message: 'Document deleted successfully'
+      });
+    } catch (error) {
+      logger.error('Error deleting document from storage:', { 
+        documentId: document.id,
+        error: error instanceof Error ? error.message : 'Unknown error' 
+      });
+      throw new ApiError('Failed to delete document from storage', 500);
     }
-    
-    // Delete document record from database
-    const deleted = await DocumentModel.delete(req.params.id);
-    
-    if (!deleted) {
-      throw new ApiError('Failed to delete document', 500);
-    }
-    
-    logger.info('Document deleted successfully', {
-      documentId: req.params.id,
-      employeeId: document.employee_id,
-      fileName: document.file_name
-    });
-    
-    res.json({
-      success: true,
-      message: 'Document deleted successfully'
-    });
   } catch (error) {
     next(error);
   }
